@@ -280,6 +280,7 @@ impl Jwt {
 		Ok(Jwt {
 			mode,
 			providers: vec![provider],
+			passthrough_token: false,
 		})
 	}
 }
