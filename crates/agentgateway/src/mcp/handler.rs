@@ -352,7 +352,7 @@ impl Relay {
 				logging: None,
 				prompts: Some(PromptsCapability::default()),
 				resources: Some(ResourcesCapability::default()),
-				tools: Some(ToolsCapability::default()),
+				tools: Some(ToolsCapability { list_changed: Some(true) }),
 			},
 			server_info: Implementation::from_build_env(),
 			instructions: Some(
