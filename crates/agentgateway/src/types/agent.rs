@@ -1161,6 +1161,8 @@ pub struct McpAuthentication {
 	pub jwks_url: String,
 	pub provider: Option<McpIDP>,
 	pub resource_metadata: ResourceMetadata,
+	#[serde(default)]
+	pub passthrough_token: bool,
 }
 
 impl McpAuthentication {
@@ -1184,6 +1186,8 @@ impl McpAuthentication {
 					}
 				},
 			},
+			// LUNA-MIND: Use configured JWT passthrough value from mcpAuthentication
+			passthrough_token: self.passthrough_token,
 		})
 	}
 }

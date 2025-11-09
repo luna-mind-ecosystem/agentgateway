@@ -62,6 +62,7 @@ pub enum JwkError {
 pub struct Jwt {
 	mode: Mode,
 	providers: Vec<Provider>,
+	passthrough_token: bool,
 }
 
 #[derive(Clone)]
@@ -121,6 +122,8 @@ pub enum LocalJwtConfig {
 		#[serde(default)]
 		mode: Mode,
 		providers: Vec<ProviderConfig>,
+		#[serde(default)]
+		passthrough_token: bool,
 	},
 	Single {
 		#[serde(default)]
@@ -128,6 +131,8 @@ pub enum LocalJwtConfig {
 		issuer: String,
 		audiences: Vec<String>,
 		jwks: serdes::FileInlineOrRemote,
+		#[serde(default)]
+		passthrough_token: bool,
 	},
 }
 
@@ -158,13 +163,14 @@ pub enum Mode {
 
 impl LocalJwtConfig {
 	pub async fn try_into(self, client: Client) -> Result<Jwt, JwkError> {
-		let (mode, providers_cfg) = match self {
-			LocalJwtConfig::Multi { mode, providers } => (mode, providers),
+		let (mode, providers_cfg, passthrough_token) = match self {
+			LocalJwtConfig::Multi { mode, providers, passthrough_token } => (mode, providers, passthrough_token),
 			LocalJwtConfig::Single {
 				mode,
 				issuer,
 				audiences,
 				jwks,
+				passthrough_token,
 			} => (
 				mode,
 				vec![ProviderConfig {
@@ -172,6 +178,7 @@ impl LocalJwtConfig {
 					audiences,
 					jwks,
 				}],
+				passthrough_token,
 			),
 		};
 
@@ -185,7 +192,7 @@ impl LocalJwtConfig {
 			let provider = Provider::from_jwks(jwks, pc.issuer, pc.audiences)?;
 			providers.push(provider);
 		}
-		Ok(Jwt { mode, providers })
+		Ok(Jwt { mode, providers, passthrough_token })
 	}
 }
 
@@ -326,8 +333,10 @@ impl Jwt {
 			log.jwt_sub = Some(sub.to_string());
 		};
 		log.cel.ctx().with_jwt(&claims);
-		// Remove the token. TODO: allow keep it
-		req.headers_mut().remove(http::header::AUTHORIZATION);
+		// LUNA-MIND: Configurable JWT passthrough to backend services
+		if !self.passthrough_token {
+			req.headers_mut().remove(http::header::AUTHORIZATION);
+		}
 		// Insert the claims into extensions so we can reference it later
 		req.extensions_mut().insert(claims);
 		Ok(())
