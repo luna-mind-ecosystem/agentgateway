@@ -93,6 +93,7 @@ impl Relay {
 	/// - PERSONALITY_SERVICE_HOST: Base URL for personality service (e.g., "http://localhost:8080")
 	/// - SCHEMA_AGGREGATOR_ENABLED: Set to "true" to enable (default: true if PERSONALITY_SERVICE_HOST is set)
 	fn create_schema_aggregator(_backend: &McpBackendGroup) -> anyhow::Result<Option<Arc<SchemaAggregator>>> {
+		use crate::mcp::upstream::schema_aggregator;
 		use std::env;
 		use std::time::Duration;
 
