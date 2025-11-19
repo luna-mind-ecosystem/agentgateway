@@ -26,6 +26,7 @@ use crate::mcp::rbac::{Identity, McpAuthorizationSet};
 use crate::mcp::router::McpBackendGroup;
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
 use crate::mcp::{ClientError, MCPInfo, mergestream, rbac, upstream};
+use crate::mcp::upstream::schema_aggregator::SchemaAggregator;
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::log::AsyncLog;
 use crate::telemetry::trc::TraceParent;
@@ -48,6 +49,8 @@ pub struct Relay {
 	// Else this is empty
 	default_target_name: Option<String>,
 	is_multiplexing: bool,
+	// LUNA-MIND: SchemaAggregator for dynamic multi-service schema polling
+	schema_aggregator: Option<Arc<SchemaAggregator>>,
 }
 
 impl Relay {
@@ -66,12 +69,94 @@ impl Relay {
 		} else {
 			Some(backend.targets[0].name.to_string())
 		};
+
+		// LUNA-MIND: Initialize SchemaAggregator for dynamic multi-service OpenAPI schemas
+		// Only initialize if we have OpenAPI targets that need dynamic polling
+		let schema_aggregator = Self::create_schema_aggregator(&backend)?;
+
 		Ok(Self {
 			upstreams: Arc::new(upstream::UpstreamGroup::new(pi, client, backend)?),
 			policies,
 			default_target_name,
 			is_multiplexing,
+			schema_aggregator,
 		})
+	}
+
+	/// Create SchemaAggregator if we have OpenAPI targets
+	///
+	/// LUNA-MIND: Uses environment variables to configure services for schema aggregation.
+	/// This allows SchemaAggregator to poll multiple services dynamically without
+	/// needing to parse complex backend configuration structures.
+	///
+	/// Environment Variables:
+	/// - PERSONALITY_SERVICE_HOST: Base URL for personality service (e.g., "http://localhost:8080")
+	/// - SCHEMA_AGGREGATOR_ENABLED: Set to "true" to enable (default: true if PERSONALITY_SERVICE_HOST is set)
+	fn create_schema_aggregator(_backend: &McpBackendGroup) -> anyhow::Result<Option<Arc<SchemaAggregator>>> {
+		use std::env;
+		use std::time::Duration;
+
+		// Check if explicitly disabled
+		if let Ok(enabled) = env::var("SCHEMA_AGGREGATOR_ENABLED") {
+			if enabled.to_lowercase() == "false" {
+				tracing::info!("SchemaAggregator: Disabled via SCHEMA_AGGREGATOR_ENABLED=false");
+				return Ok(None);
+			}
+		}
+
+		// Try to read personality service URL from environment
+		let personality_url = match env::var("PERSONALITY_SERVICE_HOST") {
+			Ok(url) => {
+				tracing::debug!("SchemaAggregator: Found PERSONALITY_SERVICE_HOST={}", url);
+				url
+			}
+			Err(_) => {
+				tracing::debug!("SchemaAggregator: PERSONALITY_SERVICE_HOST not set, using default localhost:8080");
+				"http://localhost:8080".to_string()
+			}
+		};
+
+		// Build services list
+		let mut services = Vec::new();
+
+		// Add personality service
+		services.push(schema_aggregator::ServiceConfig {
+			name: "personality".to_string(),
+			base_url: personality_url.clone(),
+			openapi_path: "/v3/api-docs".to_string(),
+		});
+
+		// TODO: Add more services from environment variables
+		// - THOUGHTS_SERVICE_HOST
+		// - GOALS_SERVICE_HOST
+		// etc.
+
+		if services.is_empty() {
+			tracing::debug!("SchemaAggregator: No services configured");
+			return Ok(None);
+		}
+
+		tracing::info!(
+			"SchemaAggregator: Initializing with {} service(s): {:?}",
+			services.len(),
+			services.iter().map(|s| &s.name).collect::<Vec<_>>()
+		);
+		tracing::info!("SchemaAggregator: Personality service URL: {}", personality_url);
+
+		// Create aggregator with 30 second polling interval
+		let (aggregator, _change_rx) = SchemaAggregator::new(
+			services,
+			Duration::from_secs(30),
+		);
+
+		let agg_arc = Arc::new(aggregator);
+
+		// Start background polling
+		agg_arc.clone().start_polling();
+
+		tracing::info!("SchemaAggregator: Polling started (interval: 30s)");
+
+		Ok(Some(agg_arc))
 	}
 
 	pub fn parse_resource_name<'a, 'b: 'a>(
@@ -101,7 +186,35 @@ impl Relay {
 	pub fn merge_tools(&self, cel: Arc<ContextBuilder>) -> Box<MergeFn> {
 		let policies = self.policies.clone();
 		let default_target_name = self.default_target_name.clone();
+		let schema_aggregator = self.schema_aggregator.clone();
+
 		Box::new(move |streams| {
+			// LUNA-MIND: If SchemaAggregator is available, use it instead of merging streams
+			if let Some(agg) = &schema_aggregator {
+				tracing::debug!("Using SchemaAggregator for tools/list");
+				let tools = agg.get_all_tools()
+					.into_iter()
+					.filter(|t| {
+						policies.validate(
+							&rbac::ResourceType::Tool(rbac::ResourceId::new(
+								"dynamic".to_string(),
+								t.name.to_string(),
+							)),
+							&cel,
+						)
+					})
+					.collect_vec();
+
+				return Ok(
+					ListToolsResult {
+						tools,
+						next_cursor: None,
+					}
+					.into(),
+				);
+			}
+
+			// Original implementation - merge from streams
 			let tools = streams
 				.into_iter()
 				.flat_map(|(server_name, s)| {
