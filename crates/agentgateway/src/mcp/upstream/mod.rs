@@ -1,4 +1,5 @@
 mod openapi;
+pub mod schema_aggregator;
 mod sse;
 mod stdio;
 mod streamablehttp;

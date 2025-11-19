@@ -97,6 +97,8 @@ impl Relay {
 		use std::env;
 		use std::time::Duration;
 
+		tracing::info!("SchemaAggregator: create_schema_aggregator() called");
+
 		// Check if explicitly disabled
 		if let Ok(enabled) = env::var("SCHEMA_AGGREGATOR_ENABLED") {
 			if enabled.to_lowercase() == "false" {

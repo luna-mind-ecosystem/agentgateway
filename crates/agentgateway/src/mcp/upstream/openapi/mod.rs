@@ -246,7 +246,7 @@ fn resolve_request_body<'a>(
 ///
 /// To support this we should create a nested JSON schema which has each of them.
 /// That way the client code can properly separate the objects passed by the client.
-pub(crate) fn parse_openapi_schema(
+pub fn parse_openapi_schema(
 	open_api: &OpenAPI,
 ) -> Result<Vec<(Tool, UpstreamOpenAPICall)>, ParseError> {
 	let tool_defs: Result<Vec<_>, _> = open_api
