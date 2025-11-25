@@ -265,7 +265,24 @@ impl Session {
 					},
 					ClientRequest::CallToolRequest(ctr) => {
 						let name = ctr.params.name.clone();
-						let (service_name, tool) = self.relay.parse_resource_name(&name)?;
+
+						// LUNA-MIND: Try SchemaAggregator first for dynamic routing
+						let (service_name_str, tool_str);
+						let (service_name, tool) = if let Some(agg) = self.relay.get_schema_aggregator() {
+							tracing::info!("Using SchemaAggregator for tool routing: {}", name);
+							if let Some(tool_info) = agg.find_tool(name.as_ref()) {
+								tracing::info!("Found tool '{}' in service '{}'", name, tool_info.service_name);
+								service_name_str = tool_info.service_name.clone();
+								tool_str = name.as_ref().to_string();
+								(service_name_str.as_str(), tool_str.as_str())
+							} else {
+								tracing::warn!("Tool '{}' not found in SchemaAggregator, falling back to parse_resource_name", name);
+								self.relay.parse_resource_name(name.as_ref())?
+							}
+						} else {
+							self.relay.parse_resource_name(name.as_ref())?
+						};
+
 						log.non_atomic_mutate(|l| {
 							l.resource_name = Some(tool.to_string());
 							l.target_name = Some(service_name.to_string());
@@ -282,6 +299,7 @@ impl Session {
 						}
 
 						let tn = tool.to_string();
+						tracing::info!("About to call send_single with service_name='{}', tool_name='{}'", service_name, tn);
 						ctr.params.name = tn.into();
 						self.relay.send_single(r, ctx, service_name).await
 					},

@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use agent_core::trcng;
 use futures_core::Stream;
@@ -41,6 +41,69 @@ fn resource_name(default_target_name: Option<&String>, target: &str, name: &str)
 	}
 }
 
+// LUNA-MIND: Global SchemaAggregator shared across all Relay instances
+static GLOBAL_SCHEMA_AGGREGATOR: LazyLock<Option<Arc<upstream::schema_aggregator::SchemaAggregator>>> =
+	LazyLock::new(|| {
+		use upstream::schema_aggregator;
+		use std::env;
+		use std::time::Duration;
+
+		tracing::info!("🌐 Initializing GLOBAL SchemaAggregator (once per process)");
+
+		if let Ok(enabled) = env::var("SCHEMA_AGGREGATOR_ENABLED") {
+			if enabled.to_lowercase() == "false" {
+				tracing::info!("SchemaAggregator: Disabled via SCHEMA_AGGREGATOR_ENABLED=false");
+				return None;
+			}
+		}
+
+		// LUNA-MIND: Read services from SCHEMA_AGGREGATOR_SERVICES env var (JSON format)
+		// Expected format: [{"name":"luna-mind-personality","base_url":"http://localhost:8080","openapi_path":"/v3/api-docs"}]
+		let services = if let Ok(services_json) = env::var("SCHEMA_AGGREGATOR_SERVICES") {
+			match serde_json::from_str::<Vec<schema_aggregator::ServiceConfig>>(&services_json) {
+				Ok(parsed) => {
+					tracing::info!("SchemaAggregator: Loaded {} services from SCHEMA_AGGREGATOR_SERVICES", parsed.len());
+					for svc in &parsed {
+						tracing::info!("  - Service '{}': {} (OpenAPI: {})", svc.name, svc.base_url, svc.openapi_path);
+					}
+					parsed
+				},
+				Err(e) => {
+					tracing::error!("SchemaAggregator: Failed to parse SCHEMA_AGGREGATOR_SERVICES: {}", e);
+					tracing::info!("SchemaAggregator: Falling back to default configuration");
+					let personality_url = env::var("PERSONALITY_SERVICE_HOST")
+						.unwrap_or_else(|_| "http://localhost:8080".to_string());
+					vec![schema_aggregator::ServiceConfig {
+						name: "luna-mind-personality".to_string(),
+						base_url: personality_url,
+						openapi_path: "/v3/api-docs".to_string(),
+					}]
+				}
+			}
+		} else {
+			tracing::info!("SchemaAggregator: SCHEMA_AGGREGATOR_SERVICES not set, using default configuration");
+			let personality_url = env::var("PERSONALITY_SERVICE_HOST")
+				.unwrap_or_else(|_| "http://localhost:8080".to_string());
+			vec![schema_aggregator::ServiceConfig {
+				name: "luna-mind-personality".to_string(),
+				base_url: personality_url,
+				openapi_path: "/v3/api-docs".to_string(),
+			}]
+		};
+
+		let (aggregator, _rx) = schema_aggregator::SchemaAggregator::new(services, Duration::from_secs(30));
+		let agg_arc = Arc::new(aggregator);
+		agg_arc.clone().start_polling();
+
+		tracing::info!("✅ Global SchemaAggregator polling started (30s interval)");
+		Some(agg_arc)
+	});
+
+// LUNA-MIND: Public getter for global SchemaAggregator (used by openapi/mod.rs)
+pub fn get_global_schema_aggregator() -> Option<Arc<upstream::schema_aggregator::SchemaAggregator>> {
+	GLOBAL_SCHEMA_AGGREGATOR.clone()
+}
+
 #[derive(Debug, Clone)]
 pub struct Relay {
 	upstreams: Arc<upstream::UpstreamGroup>,
@@ -70,9 +133,8 @@ impl Relay {
 			Some(backend.targets[0].name.to_string())
 		};
 
-		// LUNA-MIND: Initialize SchemaAggregator for dynamic multi-service OpenAPI schemas
-		// Only initialize if we have OpenAPI targets that need dynamic polling
-		let schema_aggregator = Self::create_schema_aggregator(&backend)?;
+		// LUNA-MIND: Use global SchemaAggregator instead of creating new instance per Relay
+		let schema_aggregator = GLOBAL_SCHEMA_AGGREGATOR.clone();
 
 		Ok(Self {
 			upstreams: Arc::new(upstream::UpstreamGroup::new(pi, client, backend)?),
@@ -81,85 +143,6 @@ impl Relay {
 			is_multiplexing,
 			schema_aggregator,
 		})
-	}
-
-	/// Create SchemaAggregator if we have OpenAPI targets
-	///
-	/// LUNA-MIND: Uses environment variables to configure services for schema aggregation.
-	/// This allows SchemaAggregator to poll multiple services dynamically without
-	/// needing to parse complex backend configuration structures.
-	///
-	/// Environment Variables:
-	/// - PERSONALITY_SERVICE_HOST: Base URL for personality service (e.g., "http://localhost:8080")
-	/// - SCHEMA_AGGREGATOR_ENABLED: Set to "true" to enable (default: true if PERSONALITY_SERVICE_HOST is set)
-	fn create_schema_aggregator(_backend: &McpBackendGroup) -> anyhow::Result<Option<Arc<SchemaAggregator>>> {
-		use crate::mcp::upstream::schema_aggregator;
-		use std::env;
-		use std::time::Duration;
-
-		tracing::info!("SchemaAggregator: create_schema_aggregator() called");
-
-		// Check if explicitly disabled
-		if let Ok(enabled) = env::var("SCHEMA_AGGREGATOR_ENABLED") {
-			if enabled.to_lowercase() == "false" {
-				tracing::info!("SchemaAggregator: Disabled via SCHEMA_AGGREGATOR_ENABLED=false");
-				return Ok(None);
-			}
-		}
-
-		// Try to read personality service URL from environment
-		let personality_url = match env::var("PERSONALITY_SERVICE_HOST") {
-			Ok(url) => {
-				tracing::debug!("SchemaAggregator: Found PERSONALITY_SERVICE_HOST={}", url);
-				url
-			}
-			Err(_) => {
-				tracing::debug!("SchemaAggregator: PERSONALITY_SERVICE_HOST not set, using default localhost:8080");
-				"http://localhost:8080".to_string()
-			}
-		};
-
-		// Build services list
-		let mut services = Vec::new();
-
-		// Add personality service
-		services.push(schema_aggregator::ServiceConfig {
-			name: "personality".to_string(),
-			base_url: personality_url.clone(),
-			openapi_path: "/v3/api-docs".to_string(),
-		});
-
-		// TODO: Add more services from environment variables
-		// - THOUGHTS_SERVICE_HOST
-		// - GOALS_SERVICE_HOST
-		// etc.
-
-		if services.is_empty() {
-			tracing::debug!("SchemaAggregator: No services configured");
-			return Ok(None);
-		}
-
-		tracing::info!(
-			"SchemaAggregator: Initializing with {} service(s): {:?}",
-			services.len(),
-			services.iter().map(|s| &s.name).collect::<Vec<_>>()
-		);
-		tracing::info!("SchemaAggregator: Personality service URL: {}", personality_url);
-
-		// Create aggregator with 30 second polling interval
-		let (aggregator, _change_rx) = SchemaAggregator::new(
-			services,
-			Duration::from_secs(30),
-		);
-
-		let agg_arc = Arc::new(aggregator);
-
-		// Start background polling
-		agg_arc.clone().start_polling();
-
-		tracing::info!("SchemaAggregator: Polling started (interval: 30s)");
-
-		Ok(Some(agg_arc))
 	}
 
 	pub fn parse_resource_name<'a, 'b: 'a>(
@@ -186,15 +169,23 @@ impl Relay {
 		self.default_target_name.clone()
 	}
 
+	// LUNA-MIND: Getter for SchemaAggregator (needed for dynamic tool routing in session.rs)
+	pub fn get_schema_aggregator(&self) -> Option<Arc<upstream::schema_aggregator::SchemaAggregator>> {
+		self.schema_aggregator.clone()
+	}
+
 	pub fn merge_tools(&self, cel: Arc<ContextBuilder>) -> Box<MergeFn> {
 		let policies = self.policies.clone();
 		let default_target_name = self.default_target_name.clone();
 		let schema_aggregator = self.schema_aggregator.clone();
 
+		// LUNA-MIND: Debug log to see if SchemaAggregator is set
+		tracing::info!("merge_tools() called, schema_aggregator present: {}", schema_aggregator.is_some());
+
 		Box::new(move |streams| {
 			// LUNA-MIND: If SchemaAggregator is available, use it instead of merging streams
 			if let Some(agg) = &schema_aggregator {
-				tracing::debug!("Using SchemaAggregator for tools/list");
+				tracing::info!("Using SchemaAggregator for tools/list");
 				let tools = agg.get_all_tools()
 					.into_iter()
 					.filter(|t| {
@@ -215,6 +206,8 @@ impl Relay {
 					}
 					.into(),
 				);
+			} else {
+				tracing::info!("SchemaAggregator NOT available, falling back to stream merging");
 			}
 
 			// Original implementation - merge from streams
@@ -385,11 +378,15 @@ impl Relay {
 		service_name: &str,
 	) -> Result<Response, UpstreamError> {
 		let id = r.id.clone();
+		tracing::info!("send_single: Looking for upstream '{}'", service_name);
+		tracing::info!("send_single: Available upstreams: {:?}", self.upstreams.iter_named().map(|(n, _)| n).collect::<Vec<_>>());
 		let Ok(us) = self.upstreams.get(service_name) else {
+			tracing::error!("send_single: Upstream '{}' NOT FOUND in upstreams map", service_name);
 			return Err(UpstreamError::InvalidRequest(format!(
 				"unknown service {service_name}"
 			)));
 		};
+		tracing::info!("send_single: Found upstream '{}'", service_name);
 		let stream = us.generic_stream(r, &ctx).await?;
 
 		messages_to_response(id, stream)

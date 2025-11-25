@@ -282,6 +282,31 @@ impl SchemaAggregator {
             .cloned()
     }
 
+    /// Get base URL for a service by name
+    ///
+    /// Returns the base URL (e.g., "http://localhost:8080") for making HTTP requests
+    pub fn get_service_base_url(&self, service_name: &str) -> Option<String> {
+        self.services
+            .iter()
+            .find(|s| s.name == service_name)
+            .map(|s| s.base_url.clone())
+    }
+
+    /// Get current OpenAPI schema for a specific service
+    ///
+    /// Returns the full OpenAPI schema for dynamic tool lookup
+    pub fn get_current_schema(&self) -> Option<OpenAPI> {
+        // For now, return the schema for the first service
+        // TODO: Filter by service name when we support multiple services
+        let config = self.services.first()?;
+
+        // Fetch fresh schema synchronously (blocking)
+        let url = format!("{}{}", config.base_url, config.openapi_path);
+        let response = reqwest::blocking::get(&url).ok()?;
+        let schema: OpenAPI = response.json().ok()?;
+        Some(schema)
+    }
+
     /// Get all available tools (for tools/list response)
     pub fn get_all_tools(&self) -> Vec<Tool> {
         let schema = self.current_schema.read().unwrap();

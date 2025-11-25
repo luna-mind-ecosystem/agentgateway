@@ -6,7 +6,7 @@ use http::Method;
 use http::header::{ACCEPT, CONTENT_TYPE};
 use openapiv3::{OpenAPI, Parameter, ReferenceOr, RequestBody, Schema, SchemaKind, Type};
 use reqwest::header::{HeaderName, HeaderValue};
-use rmcp::model::{ClientRequest, JsonObject, JsonRpcRequest, Tool};
+use rmcp::model::{ClientRequest, Content, JsonObject, JsonRpcRequest, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -568,10 +568,16 @@ impl Handler {
 				let res = self
 					.call_tool(ctr.params.name.as_ref(), ctr.params.arguments, ctx)
 					.await?;
+
+				// LUNA-MIND FIX: Format JSON as human-readable text for content
+				// MCP protocol requires content to be non-empty with text representation
+				let formatted_json = serde_json::to_string_pretty(&res)
+					.unwrap_or_else(|_| res.to_string());
+
 				Messages::from_result(
 					id,
 					CallToolResult {
-						content: vec![],
+						content: vec![Content::text(formatted_json)],
 						structured_content: Some(res),
 						is_error: None,
 						meta: None,
@@ -606,11 +612,45 @@ impl Handler {
 		args: Option<JsonObject>,
 		ctx: &IncomingRequestContext,
 	) -> Result<serde_json::Value, anyhow::Error> {
-		let (_tool, info) = self
-			.tools
-			.iter()
-			.find(|(t, _info)| t.name == name)
-			.ok_or_else(|| anyhow::anyhow!("tool {} not found", name))?;
+		// LUNA-MIND: Try finding tool in static tools first, or fallback to dynamic schema lookup
+		// Track dynamic backend URL if tool is found via SchemaAggregator
+		let (info, dynamic_base_url): (UpstreamOpenAPICall, Option<String>) =
+			if let Some((_, info)) = self.tools.iter().find(|(t, _)| t.name == name) {
+				// Found in static tools - use static backend
+				(info.clone(), None)
+			} else if let Some(agg) = crate::mcp::handler::get_global_schema_aggregator() {
+				tracing::info!("Tool '{}' not found in static tools, checking global SchemaAggregator", name);
+				// Check if tool exists in aggregator
+				if let Some(tool_info) = agg.find_tool(name) {
+					tracing::info!("Tool '{}' found in SchemaAggregator (service: {}), fetching fresh schema",
+						name, tool_info.service_name);
+
+					// Get base URL for the service
+					let base_url = agg.get_service_base_url(&tool_info.service_name)
+						.ok_or_else(|| anyhow::anyhow!("No base_url configured for service '{}'", tool_info.service_name))?;
+
+					// Get fresh schema from aggregator
+					if let Some(fresh_schema) = agg.get_current_schema() {
+						// Re-parse tools from fresh schema
+						let fresh_tools = parse_openapi_schema(&fresh_schema)
+							.map_err(|e| anyhow::anyhow!("Failed to parse fresh schema: {}", e))?;
+
+						// Find our tool in the fresh tools and clone the OpenAPICall info
+						if let Some((_, call_info)) = fresh_tools.iter().find(|(t, _)| t.name == name) {
+							tracing::info!("Successfully found tool '{}' in fresh schema, using base_url: {}", name, base_url);
+							(call_info.clone(), Some(base_url))
+						} else {
+							return Err(anyhow::anyhow!("tool {} not found in fresh schema", name));
+						}
+					} else {
+						return Err(anyhow::anyhow!("tool {} found in aggregator but schema not available", name));
+					}
+				} else {
+					return Err(anyhow::anyhow!("tool {} not found in aggregator", name));
+				}
+			} else {
+				return Err(anyhow::anyhow!("tool {} not found", name));
+			};
 
 		let args = args.unwrap_or_default();
 
@@ -654,14 +694,22 @@ impl Handler {
 			}
 		}
 
-		// Use normalize_url_path to avoid double slashes
-		let normalized_path = normalize_url_path(&self.prefix, &path);
-		let base_url = format!(
-			"{}://{}{}",
-			"http",
-			self.backend.hostport(),
-			normalized_path
-		);
+		// LUNA-MIND: Dynamic vs Static routing - different path handling
+		let is_dynamic = dynamic_base_url.is_some();
+		let base_url = if let Some(dynamic_url) = dynamic_base_url {
+			// Dynamic routing: base_url from SchemaAggregator already has scheme+host
+			// Just append the raw path (no prefix needed, as it's already in base_url)
+			format!("{}{}", dynamic_url, path)
+		} else {
+			// Static routing: use normalize_url_path with self.prefix
+			let normalized_path = normalize_url_path(&self.prefix, &path);
+			format!(
+				"{}://{}{}",
+				"http",
+				self.backend.hostport(),
+				normalized_path
+			)
+		};
 
 		// --- Request Building ---
 		let method = Method::from_bytes(info.method.to_uppercase().as_bytes()).map_err(|e| {
@@ -698,7 +746,8 @@ impl Handler {
 		};
 
 		let uri = format!("{base_url}{query_string}");
-		let mut rb = http::Request::builder().method(method).uri(uri);
+		tracing::info!("LUNA-MIND DEBUG: Constructing HTTP request - method={}, uri={}, dynamic={}", method, uri, is_dynamic);
+		let mut rb = http::Request::builder().method(method).uri(&uri);
 
 		rb = rb.header(ACCEPT, HeaderValue::from_static("application/json"));
 		for (key, value) in &header_params {
