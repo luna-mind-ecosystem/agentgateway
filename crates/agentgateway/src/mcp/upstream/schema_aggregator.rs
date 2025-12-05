@@ -295,6 +295,9 @@ impl SchemaAggregator {
     /// Get current OpenAPI schema for a specific service
     ///
     /// Returns the full OpenAPI schema for dynamic tool lookup
+    ///
+    /// NOTE: Currently unused - we use ToolRoutingInfo directly instead
+    #[allow(dead_code)]
     pub fn get_current_schema(&self) -> Option<OpenAPI> {
         // For now, return the schema for the first service
         // TODO: Filter by service name when we support multiple services
@@ -320,6 +323,7 @@ impl SchemaAggregator {
     }
 
     /// Get number of services being polled
+    #[allow(dead_code)]
     pub fn service_count(&self) -> usize {
         self.services.len()
     }
