@@ -622,29 +622,22 @@ impl Handler {
 				tracing::info!("Tool '{}' not found in static tools, checking global SchemaAggregator", name);
 				// Check if tool exists in aggregator
 				if let Some(tool_info) = agg.find_tool(name) {
-					tracing::info!("Tool '{}' found in SchemaAggregator (service: {}), fetching fresh schema",
+					tracing::info!("Tool '{}' found in SchemaAggregator (service: {}), using cached routing info",
 						name, tool_info.service_name);
 
 					// Get base URL for the service
 					let base_url = agg.get_service_base_url(&tool_info.service_name)
 						.ok_or_else(|| anyhow::anyhow!("No base_url configured for service '{}'", tool_info.service_name))?;
 
-					// Get fresh schema from aggregator
-					if let Some(fresh_schema) = agg.get_current_schema() {
-						// Re-parse tools from fresh schema
-						let fresh_tools = parse_openapi_schema(&fresh_schema)
-							.map_err(|e| anyhow::anyhow!("Failed to parse fresh schema: {}", e))?;
+					// LUNA-MIND FIX: Use tool_info directly instead of fetching fresh schema
+					// ToolRoutingInfo already has method and path - no need to re-parse OpenAPI
+					let call_info = UpstreamOpenAPICall {
+						method: tool_info.method.clone(),
+						path: tool_info.path.clone(),
+					};
 
-						// Find our tool in the fresh tools and clone the OpenAPICall info
-						if let Some((_, call_info)) = fresh_tools.iter().find(|(t, _)| t.name == name) {
-							tracing::info!("Successfully found tool '{}' in fresh schema, using base_url: {}", name, base_url);
-							(call_info.clone(), Some(base_url))
-						} else {
-							return Err(anyhow::anyhow!("tool {} not found in fresh schema", name));
-						}
-					} else {
-						return Err(anyhow::anyhow!("tool {} found in aggregator but schema not available", name));
-					}
+					tracing::info!("Using tool routing: {} {} (base_url: {})", call_info.method, call_info.path, base_url);
+					(call_info, Some(base_url))
 				} else {
 					return Err(anyhow::anyhow!("tool {} not found in aggregator", name));
 				}
