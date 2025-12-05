@@ -57,38 +57,38 @@ static GLOBAL_SCHEMA_AGGREGATOR: LazyLock<Option<Arc<upstream::schema_aggregator
 			}
 		}
 
-		// LUNA-MIND: Read services from SCHEMA_AGGREGATOR_SERVICES env var (JSON format)
-		// Expected format: [{"name":"luna-mind-personality","base_url":"http://localhost:8080","openapi_path":"/v3/api-docs"}]
-		let services = if let Ok(services_json) = env::var("SCHEMA_AGGREGATOR_SERVICES") {
-			match serde_json::from_str::<Vec<schema_aggregator::ServiceConfig>>(&services_json) {
-				Ok(parsed) => {
-					tracing::info!("SchemaAggregator: Loaded {} services from SCHEMA_AGGREGATOR_SERVICES", parsed.len());
-					for svc in &parsed {
-						tracing::info!("  - Service '{}': {} (OpenAPI: {})", svc.name, svc.base_url, svc.openapi_path);
-					}
-					parsed
-				},
-				Err(e) => {
-					tracing::error!("SchemaAggregator: Failed to parse SCHEMA_AGGREGATOR_SERVICES: {}", e);
-					tracing::info!("SchemaAggregator: Falling back to default configuration");
-					let personality_url = env::var("PERSONALITY_SERVICE_HOST")
-						.unwrap_or_else(|_| "http://localhost:8080".to_string());
-					vec![schema_aggregator::ServiceConfig {
-						name: "luna-mind-personality".to_string(),
-						base_url: personality_url,
+		// LUNA-MIND: Auto-discover services from environment variables
+		// Scans for <SERVICE>_SERVICE_HOST env vars and creates ServiceConfig for each
+		let services = {
+			let mut discovered = Vec::new();
+
+			// List of known service names (uppercase for env var matching)
+			let known_services = vec!["PERSONALITY", "THOUGHTS", "GOALS", "DISCOVERY"];
+
+			for service_prefix in known_services {
+				let env_var_name = format!("{}_SERVICE_HOST", service_prefix);
+				if let Ok(base_url) = env::var(&env_var_name) {
+					let service_name = format!("luna-mind-{}", service_prefix.to_lowercase());
+					discovered.push(schema_aggregator::ServiceConfig {
+						name: service_name.clone(),
+						base_url: base_url.clone(),
 						openapi_path: "/v3/api-docs".to_string(),
-					}]
+					});
+					tracing::info!("  ✓ Discovered service '{}' from {} = {}", service_name, env_var_name, base_url);
 				}
 			}
-		} else {
-			tracing::info!("SchemaAggregator: SCHEMA_AGGREGATOR_SERVICES not set, using default configuration");
-			let personality_url = env::var("PERSONALITY_SERVICE_HOST")
-				.unwrap_or_else(|_| "http://localhost:8080".to_string());
-			vec![schema_aggregator::ServiceConfig {
-				name: "luna-mind-personality".to_string(),
-				base_url: personality_url,
-				openapi_path: "/v3/api-docs".to_string(),
-			}]
+
+			if discovered.is_empty() {
+				tracing::warn!("SchemaAggregator: No *_SERVICE_HOST env vars found, using fallback");
+				discovered.push(schema_aggregator::ServiceConfig {
+					name: "luna-mind-personality".to_string(),
+					base_url: "http://localhost:8080".to_string(),
+					openapi_path: "/v3/api-docs".to_string(),
+				});
+			}
+
+			tracing::info!("SchemaAggregator: Auto-discovered {} services", discovered.len());
+			discovered
 		};
 
 		let (aggregator, _rx) = schema_aggregator::SchemaAggregator::new(services, Duration::from_secs(30));
