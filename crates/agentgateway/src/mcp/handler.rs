@@ -58,36 +58,35 @@ static GLOBAL_SCHEMA_AGGREGATOR: LazyLock<Option<Arc<upstream::schema_aggregator
 		}
 
 		// LUNA-MIND: Auto-discover services from environment variables
-		// Scans for <SERVICE>_SERVICE_HOST env vars and creates ServiceConfig for each
+		// Scans ALL env vars matching *_SERVICE_HOST pattern
 		let services = {
 			let mut discovered = Vec::new();
 
-			// List of known service names (uppercase for env var matching)
-			let known_services = vec!["PERSONALITY", "THOUGHTS", "GOALS", "DISCOVERY"];
+			// Scan all environment variables for *_SERVICE_HOST pattern
+			for (key, value) in env::vars() {
+				if key.ends_with("_SERVICE_HOST") {
+					// Extract service name from env var (e.g., "PERSONALITY_SERVICE_HOST" -> "personality")
+					let service_name = key
+						.strip_suffix("_SERVICE_HOST")
+						.unwrap()
+						.to_lowercase()
+						.replace('_', "-");
 
-			for service_prefix in known_services {
-				let env_var_name = format!("{}_SERVICE_HOST", service_prefix);
-				if let Ok(base_url) = env::var(&env_var_name) {
-					let service_name = format!("luna-mind-{}", service_prefix.to_lowercase());
 					discovered.push(schema_aggregator::ServiceConfig {
 						name: service_name.clone(),
-						base_url: base_url.clone(),
+						base_url: value.clone(),
 						openapi_path: "/v3/api-docs".to_string(),
 					});
-					tracing::info!("  ✓ Discovered service '{}' from {} = {}", service_name, env_var_name, base_url);
+					tracing::info!("  ✓ Discovered service '{}' from {} = {}", service_name, key, value);
 				}
 			}
 
 			if discovered.is_empty() {
-				tracing::warn!("SchemaAggregator: No *_SERVICE_HOST env vars found, using fallback");
-				discovered.push(schema_aggregator::ServiceConfig {
-					name: "luna-mind-personality".to_string(),
-					base_url: "http://localhost:8080".to_string(),
-					openapi_path: "/v3/api-docs".to_string(),
-				});
+				tracing::info!("SchemaAggregator: No *_SERVICE_HOST env vars found, no services configured");
+			} else {
+				tracing::info!("SchemaAggregator: Auto-discovered {} services", discovered.len());
 			}
 
-			tracing::info!("SchemaAggregator: Auto-discovered {} services", discovered.len());
 			discovered
 		};
 
